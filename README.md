@@ -141,7 +141,7 @@ py -3 auto\_request.py --bjid "ID1,ID2" --max-network-errors 0
 ```powershell
 py -3 auto\_request.py `
   --bjid "ID1,ID2" `
-  --cookie "cn\_com\_southsoft\_gms=你的值; JSESSIONID=你的值"
+  --cookie "cn_com_southsoft_gms=你的值; JSESSIONID=你的值"
 ```
 
 
@@ -152,7 +152,7 @@ py -3 auto\_request.py `
 |-|-|-|-|
 |`-h`、`--help`、`-help`|否|无|显示帮助信息并退出|
 |`--bjid`|是|交互输入|教学班 ID，可以重复使用此参数，也可以一次输入多个值|
-|`--cookie`|是|交互输入|包含 `cn\_com\_southsoft\_gms` 和 `JSESSIONID` 的 Cookie|
+|`--cookie`|是|交互输入|包含 `cn_com_southsoft_gms` 和 `JSESSIONID` 的 Cookie|
 |`--workers`|否|最多 5|并发线程数|
 |`--interval`|否|`1.0`|满员后的重试间隔，单位为秒|
 |`--timeout`|否|`8.0`|单次 HTTP 请求超时，单位为秒|
@@ -198,4 +198,4 @@ lb=1\&bjid=教学班ID
 #### 关于获取cookie
 登录系统后打开开发者工具
 选择应用程序->找到cookie
-![alt text](./template/image.pngimage-1.png)
+![alt text](./template/image-1.png)
