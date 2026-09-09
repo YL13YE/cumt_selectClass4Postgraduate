@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import argparse
 import base64
-import getpass
 import re
 import sys
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from queue import Empty, Queue
 from typing import Any
 from urllib.parse import urlencode
 
@@ -19,6 +17,19 @@ import requests
 BASE_URL = "https://gms.cumt.edu.cn"
 PATH_PREFIX = "MyHeartWillGoOnpygl/xswsxk"
 BJID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+ALREADY_SELECTED_MARKERS = (
+    "已选该班级",
+    "请勿重复选择",
+    "已经选择该班级",
+    "已经选过该班级",
+)
+FULL_CLASS_MARKERS = ("满员", "已满", "名额已满", "容量已满", "人数已达上限")
+ALREADY_DROPPED_MARKERS = (
+    "未选该班级",
+    "未选择该班级",
+    "尚未选择该班级",
+    "请勿重复退选",
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,7 @@ class Config:
     gms_token: str
     jsessionid: str
     bjids: tuple[str, ...]
+    lb: str
     pdid: str | None
     interval: float
     timeout: float
@@ -92,7 +104,7 @@ def build_session(config: Config) -> requests.Session:
 def parse_response(response: requests.Response) -> dict[str, Any] | None:
     try:
         result = response.json()
-    except (requests.exceptions.JSONDecodeError, ValueError):
+    except ValueError:
         preview = response.text.replace("\r", " ").replace("\n", " ")[:160]
         print(f"响应不是 JSON，HTTP {response.status_code}: {preview}")
         return None
@@ -121,7 +133,8 @@ def run_for_bjid(
         referer_url = build_url(config.base_url, "tcxk", config.gms_token)
         request_headers["Referer"] = f"{referer_url}?{urlencode({'code': 4, 'pdid': config.pdid})}"
 
-    data = {"lb": "1", "bjid": bjid}
+    action_name = "选课" if config.lb == "1" else "退课"
+    data = {"lb": config.lb, "bjid": bjid}
     session = build_session(config)
     consecutive_network_errors = 0
     attempt = 0
@@ -139,7 +152,6 @@ def run_for_bjid(
                     data=data,
                     timeout=config.timeout,
                 )
-                consecutive_network_errors = 0
             except requests.RequestException as exc:
                 consecutive_network_errors += 1
                 wait_seconds = min(config.interval * (2 ** (consecutive_network_errors - 1)), 10.0)
@@ -158,28 +170,55 @@ def run_for_bjid(
 
             result = parse_response(response)
             if result is None:
-                if stop_event.wait(config.interval):
+                consecutive_network_errors += 1
+                wait_seconds = min(config.interval * (2 ** (consecutive_network_errors - 1)), 10.0)
+                if (
+                    config.max_network_errors > 0
+                    and consecutive_network_errors >= config.max_network_errors
+                ):
+                    log(f"bjid={bjid} 连续响应异常达到上限，停止。", output_lock)
+                    return bjid, 2
+                if stop_event.wait(wait_seconds):
                     return bjid, 130
                 continue
 
+            consecutive_network_errors = 0
             code = result.get("code")
             code_text = str(code)
-            message = result.get("msg", result.get("message", ""))
+            message = str(result.get("msg", result.get("message", "")) or "")
             log(f"bjid={bjid} 服务器响应: code={code}, msg={message}", output_lock)
 
             if code_text == "200":
-                log(f"bjid={bjid} 选课成功。", output_lock)
+                log(f"bjid={bjid} {action_name}成功。", output_lock)
                 return bjid, 0
-
-            if code_text == "300":
-                log(f"bjid={bjid} 当前满员，{config.interval:g} 秒后重试。", output_lock)
-                if stop_event.wait(config.interval):
-                    return bjid, 130
-                continue
 
             if response.status_code in (401, 403) or code_text in {"401", "403"}:
                 log(f"bjid={bjid} 登录状态可能已失效，请更新 Cookie。", output_lock)
                 return bjid, 3
+
+            if code_text == "300":
+                if config.lb == "1" and any(
+                    marker in message for marker in ALREADY_SELECTED_MARKERS
+                ):
+                    log(f"bjid={bjid} 已在选课结果中，按成功计入。", output_lock)
+                    return bjid, 0
+
+                if config.lb == "0" and any(
+                    marker in message for marker in ALREADY_DROPPED_MARKERS
+                ):
+                    log(f"bjid={bjid} 当前已是未选状态，按退课成功计入。", output_lock)
+                    return bjid, 0
+
+                if config.lb == "1" and any(
+                    marker in message for marker in FULL_CLASS_MARKERS
+                ):
+                    log(f"bjid={bjid} 当前满员，{config.interval:g} 秒后重试。", output_lock)
+                    if stop_event.wait(config.interval):
+                        return bjid, 130
+                    continue
+
+                log(f"bjid={bjid} {action_name}未成功，停止重试。", output_lock)
+                return bjid, 4
 
             log(f"bjid={bjid} 收到未识别的业务状态，停止。", output_lock)
             return bjid, 4
@@ -193,35 +232,75 @@ def run_all(config: Config) -> int:
     stop_event = threading.Event()
     output_lock = threading.Lock()
     results: dict[str, int] = {}
+    task_queue: Queue[str] = Queue()
+    result_queue: Queue[tuple[str, int]] = Queue()
 
+    for bjid in config.bjids:
+        task_queue.put(bjid)
+
+    action_name = "选课" if config.lb == "1" else "退课"
     log(
-        f"已准备 {len(config.bjids)} 个 bjid，使用 {config.workers} 个线程并发请求。",
+        f"已准备 {len(config.bjids)} 个 bjid，操作：{action_name}，"
+        f"使用 {config.workers} 个线程并发请求。",
         output_lock,
     )
     log("按 Ctrl+C 可停止全部请求。", output_lock)
 
-    executor = ThreadPoolExecutor(max_workers=config.workers)
-    futures = [
-        executor.submit(run_for_bjid, config, bjid, stop_event, output_lock)
-        for bjid in config.bjids
-    ]
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                bjid = task_queue.get_nowait()
+            except Empty:
+                return
 
+            try:
+                if stop_event.is_set():
+                    return
+                try:
+                    result = run_for_bjid(config, bjid, stop_event, output_lock)
+                except Exception as exc:
+                    log(f"bjid={bjid} 任务发生未预期异常: {exc}", output_lock)
+                    result = (bjid, 5)
+                result_queue.put(result)
+            finally:
+                task_queue.task_done()
+
+    threads = [
+        threading.Thread(target=worker, name=f"course-worker-{index + 1}", daemon=True)
+        for index in range(config.workers)
+    ]
+    for thread in threads:
+        thread.start()
+
+    interrupted = False
     try:
-        for future in as_completed(futures):
-            bjid, status = future.result()
+        while len(results) < len(config.bjids):
+            try:
+                bjid, status = result_queue.get(timeout=0.2)
+            except Empty:
+                if not any(thread.is_alive() for thread in threads):
+                    break
+                continue
             results[bjid] = status
     except KeyboardInterrupt:
-        log("收到停止信号，正在停止全部线程。", output_lock)
+        interrupted = True
+        log("收到停止信号，立即结束全部任务。", output_lock)
         stop_event.set()
-        for future in futures:
-            future.cancel()
         return 130
     finally:
         stop_event.set()
-        executor.shutdown(wait=True, cancel_futures=True)
+        if not interrupted:
+            for thread in threads:
+                thread.join()
 
     success_count = sum(status == 0 for status in results.values())
-    log(f"全部任务结束，成功 {success_count}/{len(config.bjids)} 个。", output_lock)
+    failure_count = sum(status in {3, 4} for status in results.values())
+    unknown_count = len(config.bjids) - success_count - failure_count
+    log(
+        f"全部任务结束：已确认{action_name}成功 {success_count}/{len(config.bjids)} 个，"
+        f"明确失败 {failure_count} 个，状态未知 {unknown_count} 个。",
+        output_lock,
+    )
     return 0 if success_count > 0 else 1
 
 
@@ -258,12 +337,12 @@ def parse_args() -> Config:
         add_help=False,
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
-            "多教学班并发选课请求脚本。\n"
+            "多教学班并发选课/退课请求脚本。\n"
             "请求地址根据 Cookie 中的 cn_com_southsoft_gms 动态生成。"
         ),
         epilog=(
             "使用示例：\n"
-            "  1. 交互输入 bjid 和 Cookie：\n"
+            "  1. 交互输入 bjid、操作类型和两个 Cookie 值：\n"
             "     py -3 auto_request.py\n\n"
             "  2. 指定多个 bjid，Cookie 仍由程序提示输入：\n"
             "     py -3 auto_request.py --bjid ID1 --bjid ID2\n\n"
@@ -273,14 +352,13 @@ def parse_args() -> Config:
             "     py -3 auto_request.py --bjid ID1,ID2 --workers 2 --interval 1.5\n\n"
             "  5. 需要 Referer 时提供 pdid：\n"
             "     py -3 auto_request.py --bjid ID1 --pdid COURSE_ID\n\n"
-            "Cookie 输入格式：\n"
-            "  cn_com_southsoft_gms=你的值; JSESSIONID=你的值\n"
-            "也可粘贴以 Cookie: 开头的完整请求头。\n\n"
+            "交互输入时会分别提示输入 cn_com_southsoft_gms 和 JSESSIONID 的值。\n"
+            "--cookie 仍可接收包含这两项的完整 Cookie 请求头。\n\n"
             "说明：\n"
             "  bjid                 教学班 ID，至少填写一个。\n"
             "  pdid                 可选，仅用于生成 Referer。\n"
             "  workers              并发线程数，默认值为 bjid 数量，最多 5。\n"
-            "  interval             满员后的重试间隔，默认 1 秒。\n"
+            "  interval             选课满员或请求异常后的重试间隔，默认 1 秒。\n"
             "  timeout              单次请求超时，默认 8 秒。\n"
             "  max-network-errors   每个 bjid 的连续网络错误上限，默认 5；0 表示不限制。\n\n"
             "运行期间按 Ctrl+C 可停止全部线程。"
@@ -331,15 +409,23 @@ def parse_args() -> Config:
     if invalid_bjids:
         parser.error(f"以下 bjid 不是标准 UUID 格式: {', '.join(invalid_bjids)}")
 
+    while True:
+        lb = input("请选择操作（0=退课，1=选课）：").strip()
+        if lb in {"0", "1"}:
+            break
+        print("输入无效，请输入 0（退课）或 1（选课）。")
+
     cookie_header = args.cookie
-    if not cookie_header:
-        cookie_header = input(
-            "请输入 Cookie（cn_com_southsoft_gms=...; JSESSIONID=...）："
-        )
-    try:
-        gms_token, jsessionid = parse_cookie(cookie_header)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if cookie_header:
+        try:
+            gms_token, jsessionid = parse_cookie(cookie_header)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        gms_token = input("请输入 cn_com_southsoft_gms：").strip().strip('"')
+        jsessionid = input("请输入 JSESSIONID：").strip().strip('"')
+        if not gms_token or not jsessionid:
+            parser.error("cn_com_southsoft_gms 和 JSESSIONID 均不能为空")
 
     if args.max_network_errors < 0:
         parser.error("--max-network-errors 不能小于 0")
@@ -351,6 +437,7 @@ def parse_args() -> Config:
         gms_token=gms_token,
         jsessionid=jsessionid,
         bjids=raw_bjids,
+        lb=lb,
         pdid=args.pdid.strip() if args.pdid else None,
         interval=args.interval,
         timeout=args.timeout,
@@ -362,5 +449,3 @@ def parse_args() -> Config:
 
 if __name__ == "__main__":
     sys.exit(run_all(parse_args()))
-
-
